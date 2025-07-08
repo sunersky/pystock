@@ -24,6 +24,7 @@ MANIFEST
 # PyInstaller
 *.manifest
 *.spec
+*.exe
 
 # Installer logs
 pip-log.txt
