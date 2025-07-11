@@ -1079,16 +1079,41 @@ def create_excel_file(file_path, stock_name, data):
 def save_index_file(processed_stocks):
     """保存索引文件"""
     try:
-        lines = ["股票代码,股票名称,上市日期,上市年限,文件路径\n"]
+        # 如果索引文件已存在，先加载现有内容
+        existing_stocks = {}
+        if os.path.exists(INDEX_FILE):
+            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+                lines = f.readlines()[1:]  # 跳过标题行
+            
+            for line in lines:
+                parts = line.strip().split(',')
+                if len(parts) >= 5:
+                    stock_code = parts[0]
+                    existing_stocks[stock_code] = {
+                        '股票代码': parts[0],
+                        '股票名称': parts[1],
+                        '上市日期': parts[2],
+                        '上市年限': parts[3],
+                        '文件路径': parts[4]
+                    }
         
-        for stock_info in processed_stocks:
+        # 合并新处理的股票到现有索引中
+        if isinstance(processed_stocks, list):
+            for stock_info in processed_stocks:
+                existing_stocks[stock_info['股票代码']] = stock_info
+        elif isinstance(processed_stocks, dict):
+            existing_stocks[processed_stocks['股票代码']] = processed_stocks
+        
+        # 写入合并后的索引
+        lines = ["股票代码,股票名称,上市日期,上市年限,文件路径\n"]
+        for stock_code, stock_info in existing_stocks.items():
             line = f"{stock_info['股票代码']},{stock_info['股票名称']},{stock_info['上市日期']},{stock_info['上市年限']},{stock_info['文件路径']}\n"
             lines.append(line)
         
         with open(INDEX_FILE, 'w', encoding='utf-8') as f:
             f.writelines(lines)
         
-        log_message("INFO", f"索引文件已保存，包含 {len(processed_stocks)} 只股票")
+        log_message("INFO", f"索引文件已更新，现包含 {len(existing_stocks)} 只股票")
         return True
         
     except Exception as e:
@@ -1267,7 +1292,7 @@ def process_single_stock(stock_info, thread_id=0):
         if found_file:
             log_message("INFO", f"线程{thread_id} 股票 {stock_code} 文件已存在，跳过")
             global_stats.update_success()
-            return {
+            result = {
                 'stock_code': stock_code,
                 'stock_name': stock_name,
                 'listing_date': '',
@@ -1275,6 +1300,8 @@ def process_single_stock(stock_info, thread_id=0):
                 'file_path': found_file,
                 'status': 'skipped'
             }
+            # 不需要更新索引，因为文件已存在
+            return result
         
         # 获取上市日期和历史数据
         listing_date = get_stock_listing_date(stock_code)
@@ -1300,7 +1327,7 @@ def process_single_stock(stock_info, thread_id=0):
             if create_excel_file(file_path, stock_name, hist_data):
                 log_message("INFO", f"线程{thread_id} 股票 {stock_code} 处理完成，数据量: {len(hist_data)}")
                 global_stats.update_success()
-                return {
+                result = {
                     'stock_code': stock_code,
                     'stock_name': stock_name,
                     'listing_date': listing_date,
@@ -1308,6 +1335,19 @@ def process_single_stock(stock_info, thread_id=0):
                     'file_path': file_path,
                     'status': 'success'
                 }
+                
+                # 立即更新索引文件，确保每个成功处理的股票都被记录
+                with index_update_lock:
+                    stock_info_for_index = {
+                        '股票代码': stock_code,
+                        '股票名称': stock_name,
+                        '上市日期': listing_date,
+                        '上市年限': years,
+                        '文件路径': file_path
+                    }
+                    save_index_file(stock_info_for_index)
+                
+                return result
             else:
                 global_stats.update_failure()
                 return None
@@ -1361,13 +1401,14 @@ def initial_mode():
             if found_file:
                 log_message("INFO", f"股票 {stock_code} 文件已存在，跳过")
                 anti_block_manager.update_success()
-                processed_stocks.append({
+                stock_info = {
                     '股票代码': stock_code,
                     '股票名称': stock_name,
                     '上市日期': '',  # 暂时留空，避免网络请求
                     '上市年限': found_years,
                     '文件路径': found_file
-                })
+                }
+                processed_stocks.append(stock_info)
                 success_count += 1
                 continue
             
@@ -1395,21 +1436,21 @@ def initial_mode():
             if create_excel_file(file_path, stock_name, hist_data):
                 log_message("INFO", f"股票 {stock_code} 处理完成，数据量: {len(hist_data)}")
                 anti_block_manager.update_success()
-                processed_stocks.append({
+                stock_info = {
                     '股票代码': stock_code,
                     '股票名称': stock_name,
                     '上市日期': listing_date,
                     '上市年限': years,
                     '文件路径': file_path
-                })
+                }
+                processed_stocks.append(stock_info)
                 success_count += 1
+                
+                # 立即更新索引文件，确保每个成功处理的股票都被记录
+                save_index_file(stock_info)
             else:
                 anti_block_manager.update_failure(stock_code)
                 failed_count += 1
-            
-            # 每10只股票保存一次索引
-            if len(processed_stocks) % 10 == 0:
-                save_index_file(processed_stocks)
             
         except Exception as e:
             log_message("ERROR", f"处理股票 {stock_code} 时发生错误: {str(e)}")
@@ -1417,7 +1458,7 @@ def initial_mode():
             failed_count += 1
             continue
     
-    # 保存最终索引文件
+    # 保存最终索引文件（虽然每个股票都已经更新，但为了安全起见，再保存一次完整的）
     save_index_file(processed_stocks)
     
     # 获取详细统计信息
@@ -1502,6 +1543,17 @@ def update_mode():
             log_message("INFO", f"股票 {stock_code} 更新完成，新增 {len(new_data)} 条数据")
             success_count += 1
             
+            # 立即更新索引文件，确保每个成功更新的股票都被记录
+            # 在更新模式下，我们只需要确保文件路径正确，其他信息不变
+            updated_stock_info = {
+                '股票代码': stock_code,
+                '股票名称': stock_info['股票名称'],
+                '上市日期': stock_info['上市日期'],
+                '上市年限': stock_info['上市年限'],
+                '文件路径': file_path
+            }
+            save_index_file(updated_stock_info)
+            
         except Exception as e:
             log_message("ERROR", f"更新股票 {stock_code} 时发生错误: {str(e)}")
             failed_count += 1
@@ -1567,11 +1619,8 @@ def initial_mode_multithread():
                     else:
                         failed_count += 1
                     
-                    # 每50只股票保存一次索引和进度报告
+                    # 每50只股票显示一次进度报告
                     if completed_count % 50 == 0:
-                        with index_update_lock:
-                            save_index_file(processed_stocks)
-                        
                         progress = (completed_count / total_stocks) * 100
                         success_rate = (len(processed_stocks) / completed_count) * 100 if completed_count > 0 else 0
                         log_message("INFO", f"进度: {completed_count}/{total_stocks} ({progress:.1f}%), "
@@ -1602,7 +1651,7 @@ def initial_mode_multithread():
     
     global_stats.active_threads = 0
     
-    # 保存最终索引文件
+    # 保存最终索引文件（虽然每个股票都已经更新，但为了安全起见，再保存一次完整的）
     save_index_file(processed_stocks)
     
     # 统计结果
@@ -1960,7 +2009,103 @@ def auto_mode():
             log_message("ERROR", "3线程初始化模式失败")
             return False
 
-# 如果直接运行此文件，执行测试
+def sync_index_with_files():
+    """同步索引文件与实际文件，确保一致性"""
+    log_message("INFO", "=== 同步索引与文件 ===")
+    log_message("INFO", "正在扫描文件夹中的所有股票文件...")
+    
+    # 扫描所有文件夹中的Excel文件
+    found_files = {}
+    total_files = 0
+    
+    # 遍历所有可能的年限文件夹（0-35年）
+    for years in range(36):
+        years_dir = os.path.join(DATA_DIR, f"{years}年")
+        if not os.path.exists(years_dir):
+            continue
+            
+        # 获取该文件夹中的所有Excel文件
+        excel_files = [f for f in os.listdir(years_dir) if f.endswith('.xlsx') and not f.startswith('~$')]
+        for file in excel_files:
+            total_files += 1
+            # 从文件名中提取股票代码和名称
+            parts = file.split('_', 1)
+            if len(parts) == 2:
+                stock_code = parts[0]
+                stock_name = parts[1].replace('.xlsx', '')
+                
+                # 记录找到的文件
+                found_files[stock_code] = {
+                    '股票代码': stock_code,
+                    '股票名称': stock_name,
+                    '上市日期': '',  # 暂时留空
+                    '上市年限': years,
+                    '文件路径': os.path.join(years_dir, file)
+                }
+    
+    log_message("INFO", f"在文件夹中找到 {total_files} 个股票文件")
+    
+    # 加载现有索引
+    existing_index = load_existing_index()
+    existing_count = len(existing_index) if existing_index else 0
+    log_message("INFO", f"现有索引中有 {existing_count} 条记录")
+    
+    # 合并信息
+    for stock_code, file_info in found_files.items():
+        if stock_code in existing_index:
+            # 保留上市日期信息
+            file_info['上市日期'] = existing_index[stock_code]['上市日期']
+        else:
+            # 对于新文件，尝试获取上市日期
+            try:
+                file_info['上市日期'] = get_stock_listing_date(stock_code)
+            except:
+                file_info['上市日期'] = ''
+    
+    # 保存更新后的索引
+    save_index_file(list(found_files.values()))
+    log_message("INFO", f"索引已更新，现包含 {len(found_files)} 条记录")
+    
+    return True
+
+# 修改auto_mode函数，添加同步选项
+def auto_mode(sync_files=False):
+    """自动模式 - 自动检测是否需要初始化或更新"""
+    log_message("INFO", "=== 自动模式 ===")
+    
+    # 如果需要同步文件和索引
+    if sync_files:
+        log_message("INFO", "执行文件与索引同步...")
+        if sync_index_with_files():
+            log_message("INFO", "同步完成")
+        else:
+            log_message("ERROR", "同步失败")
+        return True
+    
+    # 自动使用优化模式
+    switch_to_optimized_mode()
+    log_message("INFO", "自动选择优化模式（较快）")
+    
+    # 检查索引文件是否存在
+    if os.path.exists(INDEX_FILE):
+        log_message("INFO", "检测到现有索引文件，执行更新模式")
+        if update_mode():
+            log_message("INFO", "更新模式完成")
+            return True
+        else:
+            log_message("ERROR", "更新模式失败")
+            return False
+    else:
+        log_message("INFO", "未检测到索引文件，执行初始化模式")
+        log_message("INFO", "自动选择3线程模式")
+        if initial_mode_multithread():
+            log_message("INFO", "3线程初始化模式完成")
+            return True
+        else:
+            log_message("ERROR", "3线程初始化模式失败")
+            return False
+
+# 修改命令行参数处理
 if __name__ == "__main__":
     # 检查命令行参数
     if len(sys.argv) > 1:
@@ -1968,6 +2113,8 @@ if __name__ == "__main__":
             test_years_calculation()
         elif sys.argv[1] == "--auto":
             auto_mode()
+        elif sys.argv[1] == "--sync":
+            sync_index_with_files()
         elif sys.argv[1] == "--fix":
             classification_fix_mode()
         elif sys.argv[1] == "--update":
