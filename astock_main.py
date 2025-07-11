@@ -254,6 +254,7 @@ class AntiBlockManager:
         self.failure_count = 0  # 新增：失败次数
         self.failed_stocks = set()
         self.connection_aborted_count = 0
+        self.current_ua_index = 0  # 添加UA索引初始化
         
         # 缓存相关
         self.cache_file = "api_cache.json"
