@@ -26,19 +26,65 @@ def main():
             print(f"清理 {folder} 文件夹...")
             shutil.rmtree(folder)
     
+    # 创建spec文件
+    spec_content = """# -*- mode: python ; coding: utf-8 -*-
+
+block_cipher = None
+
+a = Analysis(
+    ['auto_run.py'],
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=['pandas', 'openpyxl', 'akshare', 'numpy', 'requests', 'colorama'],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    [],
+    name='A股数据自动更新工具',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon='stock.ico' if os.path.exists('stock.ico') else None,
+)
+"""
+    
+    # 写入spec文件
+    with open("auto_run.spec", "w", encoding="utf-8") as f:
+        f.write(spec_content)
+    
+    print("已创建自定义spec文件")
+    
     # 构建命令
     build_cmd = [
         "pyinstaller",
         "--noconfirm",
-        "--onefile",
-        "--windowed",
-        "--icon=stock.ico" if os.path.exists("stock.ico") else "",
-        "--name=A股数据自动更新工具",
-        "auto_run.py"
+        "auto_run.spec"
     ]
-    
-    # 移除空选项
-    build_cmd = [cmd for cmd in build_cmd if cmd]
     
     print("开始构建...")
     print("执行命令:", " ".join(build_cmd))
