@@ -1859,62 +1859,18 @@ def main():
                 log_message("ERROR", "分类修复模式失败")
             break
         elif choice in ['1', '2']:
-            # 对于下载模式，需要先选择速度和线程模式
-            print()
-            
-            # 速度模式选择
-            print("请选择速度模式:")
-            print("1. 保守模式 - 稳定但较慢（预计15-22小时）")
-            print("2. 优化模式 - 较快但风险稍高（预计8-12小时）")
-            
-            while True:
-                speed_choice = input("请输入选择 (1 或 2): ").strip()
-                if speed_choice == '1':
-                    switch_to_conservative_mode()
-                    break
-                elif speed_choice == '2':
-                    switch_to_optimized_mode()
-                    print("⚠️  注意：优化模式速度更快，但如果遇到频繁失败，程序会自动切换回保守模式")
-                    break
-                else:
-                    print("无效选择，请重新输入")
-            
-            print()
-            
-            # 线程模式选择
-            print("请选择线程模式:")
-            print("1. 单线程模式 - 稳定可靠")
-            print("2. 3线程模式 - 速度提升40-50%")
-            
-            use_multithread = False
-            while True:
-                thread_choice = input("请输入选择 (1 或 2): ").strip()
-                if thread_choice == '1':
-                    use_multithread = False
-                    log_message("INFO", "选择单线程模式")
-                    break
-                elif thread_choice == '2':
-                    use_multithread = True
-                    log_message("INFO", "选择3线程模式")
-                    break
-                else:
-                    print("无效选择，请重新输入")
-            
-            print()
+            # 自动使用优化模式和多线程模式
+            switch_to_optimized_mode()
+            log_message("INFO", "自动选择优化模式（较快）")
             
             # 执行相应的下载模式
             if choice == '1':
                 log_message("INFO", "用户选择：初始化模式")
-                if use_multithread:
-                    if initial_mode_multithread():
-                        log_message("INFO", "3线程初始化模式完成")
-                    else:
-                        log_message("ERROR", "3线程初始化模式失败")
+                log_message("INFO", "自动选择3线程模式")
+                if initial_mode_multithread():
+                    log_message("INFO", "3线程初始化模式完成")
                 else:
-                    if initial_mode():
-                        log_message("INFO", "单线程初始化模式完成")
-                    else:
-                        log_message("ERROR", "单线程初始化模式失败")
+                    log_message("ERROR", "3线程初始化模式失败")
             elif choice == '2':
                 log_message("INFO", "用户选择：更新模式")
                 if update_mode():
@@ -1977,10 +1933,50 @@ def test_years_calculation():
     print("-" * 50)
     print("测试完成")
 
+def auto_mode():
+    """自动模式 - 自动检测是否需要初始化或更新"""
+    log_message("INFO", "=== 自动模式 ===")
+    
+    # 自动使用优化模式
+    switch_to_optimized_mode()
+    log_message("INFO", "自动选择优化模式（较快）")
+    
+    # 检查索引文件是否存在
+    if os.path.exists(INDEX_FILE):
+        log_message("INFO", "检测到现有索引文件，执行更新模式")
+        if update_mode():
+            log_message("INFO", "更新模式完成")
+            return True
+        else:
+            log_message("ERROR", "更新模式失败")
+            return False
+    else:
+        log_message("INFO", "未检测到索引文件，执行初始化模式")
+        log_message("INFO", "自动选择3线程模式")
+        if initial_mode_multithread():
+            log_message("INFO", "3线程初始化模式完成")
+            return True
+        else:
+            log_message("ERROR", "3线程初始化模式失败")
+            return False
+
 # 如果直接运行此文件，执行测试
 if __name__ == "__main__":
     # 检查命令行参数
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        test_years_calculation()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--test":
+            test_years_calculation()
+        elif sys.argv[1] == "--auto":
+            auto_mode()
+        elif sys.argv[1] == "--fix":
+            classification_fix_mode()
+        elif sys.argv[1] == "--update":
+            switch_to_optimized_mode()
+            update_mode()
+        elif sys.argv[1] == "--init":
+            switch_to_optimized_mode()
+            initial_mode_multithread()
+        else:
+            main()
     else:
         main() 
