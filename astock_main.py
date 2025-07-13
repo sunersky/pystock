@@ -18,6 +18,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 import concurrent.futures
+import csv
 
 # 修复PyInstaller打包后的akshare导入问题
 def fix_akshare_import():
@@ -260,7 +261,7 @@ class AntiBlockManager:
         self.cache_file = "api_cache.json"
         self.cache_data = {}
         self.load_cache()
-    
+        
     def load_cache(self):
         """加载缓存"""
         try:
@@ -575,7 +576,7 @@ def get_stock_listing_date(stock_code):
                 first_date = first_date.strftime("%Y-%m-%d")
             
             return first_date
-        
+            
         # 如果完全没有数据，说明股票可能已退市或代码错误
         log_message("WARNING", f"股票 {stock_code} 无任何历史数据，可能已退市或代码错误")
         return "2000-01-01"
@@ -600,7 +601,6 @@ def calculate_years_since_listing(listing_date):
                 year = int(listing_date[:4]) if len(listing_date) >= 4 else 2000
                 month = 1
                 day = 1
-                
             listing_date_obj = date(year, month, day)
         else:
             # 已经是date对象
@@ -1010,43 +1010,47 @@ def get_stock_name(stock_code):
         return stock_code
 
 def create_excel_file(file_path, stock_name, data):
-    """创建Excel文件（基于模板文件）"""
+    """创建Excel文件（基于模板文件，始终写入Sheet1）"""
     try:
         # 检查模板文件是否存在
         if os.path.exists(TEMPLATE_FILE):
             # 使用模板文件作为基础
             log_message("INFO", f"使用模板文件: {TEMPLATE_FILE}")
             wb = load_workbook(TEMPLATE_FILE)
-            ws = wb.active  # 使用第一个工作表
-            
-            # 检查模板是否已有表头
+            # 强制写入Sheet1，如果没有则新建
+            if 'Sheet1' in wb.sheetnames:
+                ws = wb['Sheet1']
+            else:
+                ws = wb.create_sheet('Sheet1', 0)
+                # 写入表头
+                for col, header in enumerate(EXCEL_HEADERS, 1):
+                    ws.cell(row=1, column=col, value=header)
+                log_message("INFO", "模板无Sheet1，已自动创建Sheet1并写入表头")
+            # 检查Sheet1是否已有表头
             existing_headers = []
             for col in range(1, 13):  # 检查前12列
                 header_value = ws.cell(row=1, column=col).value
                 if header_value:
                     existing_headers.append(str(header_value))
-            
-            # 如果模板没有表头或表头不匹配，写入标准表头
+            # 如果表头不完整或不匹配，写入标准表头
             if len(existing_headers) < 12 or existing_headers != EXCEL_HEADERS:
-                log_message("INFO", "模板表头不完整，写入标准表头")
+                log_message("INFO", "Sheet1表头不完整，写入标准表头")
                 for col, header in enumerate(EXCEL_HEADERS, 1):
                     ws.cell(row=1, column=col, value=header)
             else:
-                log_message("INFO", "使用模板已有表头")
+                log_message("INFO", "Sheet1已有标准表头")
         else:
             # 模板文件不存在，创建新工作簿
             log_message("INFO", "模板文件不存在，创建新工作簿")
             wb = Workbook()
             ws = wb.active
-            
+            ws.title = 'Sheet1'
             # 写入表头
             for col, header in enumerate(EXCEL_HEADERS, 1):
                 ws.cell(row=1, column=col, value=header)
-        
         # 清除现有数据（保留表头）
         if ws.max_row > 1:
             ws.delete_rows(2, ws.max_row - 1)
-        
         # 写入数据
         for row_idx, (_, row_data) in enumerate(data.iterrows(), 2):
             for col_idx, header in enumerate(EXCEL_HEADERS, 1):
@@ -1055,110 +1059,106 @@ def create_excel_file(file_path, stock_name, data):
                 else:
                     value = row_data[header]
                     cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                    
                     # 对涨幅和振幅字段设置为百分比格式
                     if header in ['涨幅', '振幅'] and isinstance(value, (int, float)):
-                        # 将数值转换为小数（Excel百分比格式基于小数）
                         cell.value = value / 100
-                        # 设置单元格格式为百分比（保留2位小数）
                         cell.number_format = '0.00%'
-        
         # 保存文件
         wb.save(file_path)
-        
         # 输出工作表信息
         sheet_names = wb.sheetnames
         log_message("INFO", f"Excel文件已创建，包含工作表: {', '.join(sheet_names)}")
-        
         return True
-        
     except Exception as e:
         log_message("ERROR", f"创建Excel文件失败: {str(e)}")
         return False
 
-def save_index_file(processed_stocks):
-    """保存索引文件"""
-    try:
-        # 如果索引文件已存在，先加载现有内容
-        existing_stocks = {}
-        if os.path.exists(INDEX_FILE):
-            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-                lines = f.readlines()[1:]  # 跳过标题行
-            
-            for line in lines:
-                parts = line.strip().split(',')
-                if len(parts) >= 5:
-                    stock_code = parts[0]
-                    existing_stocks[stock_code] = {
-                        '股票代码': parts[0],
-                        '股票名称': parts[1],
-                        '上市日期': parts[2],
-                        '上市年限': parts[3],
-                        '文件路径': parts[4]
-                    }
-        
+def save_index_file(processed_stocks_list, index_path):
+    """
+    更新索引文件. 这是一个原子操作, 线程安全.
+    processed_stocks_list: 一个包含股票信息字典的列表.
+    """
+    log_message("DEBUG", f"准备写入索引文件: {index_path}, 新增股票数: {len(processed_stocks_list)}")
+    INDEX_HEADERS = ['股票代码', '股票名称', '上市日期', '上市年限', '文件路径']
+    with index_update_lock:
+        existing_stocks = load_existing_index(index_path)
         # 合并新处理的股票到现有索引中
-        if isinstance(processed_stocks, list):
-            for stock_info in processed_stocks:
-                existing_stocks[stock_info['股票代码']] = stock_info
-        elif isinstance(processed_stocks, dict):
-            existing_stocks[processed_stocks['股票代码']] = processed_stocks
-        
-        # 写入合并后的索引
-        lines = ["股票代码,股票名称,上市日期,上市年限,文件路径\n"]
-        for stock_code, stock_info in existing_stocks.items():
-            line = f"{stock_info['股票代码']},{stock_info['股票名称']},{stock_info['上市日期']},{stock_info['上市年限']},{stock_info['文件路径']}\n"
-            lines.append(line)
-        
-        with open(INDEX_FILE, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
-        
-        log_message("INFO", f"索引文件已更新，现包含 {len(existing_stocks)} 只股票")
-        return True
-        
-    except Exception as e:
-        log_message("ERROR", f"保存索引文件失败: {str(e)}")
-        return False
+        for stock_info in processed_stocks_list:
+            stock_code = str(stock_info.get('股票代码')).zfill(6)
+            if not stock_code or stock_code == '000000': continue # 跳过无效代码
+            # 确保所有字段都存在
+            full_info = {h: stock_info.get(h, '') for h in INDEX_HEADERS}
+            full_info['股票代码'] = stock_code # 确保代码是6位数
+            existing_stocks[stock_code] = full_info
+        if not existing_stocks:
+            log_message("DEBUG", f"索引为空，未写入: {index_path}")
+            return
+        try:
+            # 按股票代码排序后写入
+            sorted_codes = sorted(existing_stocks.keys())
+            log_message("DEBUG", f"已打开索引文件: {index_path}，准备写入")
+            with open(index_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=INDEX_HEADERS)
+                writer.writeheader()
+                for code in sorted_codes:
+                    writer.writerow(existing_stocks[code])
+            log_message("DEBUG", f"索引文件写入完成: {index_path}")
+        except Exception as e:
+            log_message("ERROR", f"保存索引文件失败: {e}")
 
-def load_existing_index():
+def load_existing_index(index_path):
     """加载现有的索引文件"""
-    try:
-        if os.path.exists(INDEX_FILE):
-            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-                lines = f.readlines()[1:]  # 跳过标题行
-            
-            processed_stocks = {}
-            for line in lines:
-                parts = line.strip().split(',')
-                if len(parts) >= 5:
-                    stock_code = parts[0]
-                    try:
-                        # 安全地转换上市年限
-                        years_str = parts[3]
-                        if years_str.isdigit():
-                            years = int(years_str)
-                        else:
-                            years = 0
-                        
-                        processed_stocks[stock_code] = {
-                            '股票代码': parts[0],
-                            '股票名称': parts[1],
-                            '上市日期': parts[2],
-                            '上市年限': years,
-                            '文件路径': parts[4]
-                        }
-                    except Exception as e:
-                        log_message("WARNING", f"解析索引行失败: {line.strip()}, 错误: {str(e)}")
-                        continue
-            
-            log_message("INFO", f"加载现有索引，已处理 {len(processed_stocks)} 只股票")
-            return processed_stocks
-        else:
-            return {}
-            
-    except Exception as e:
-        log_message("ERROR", f"加载索引文件失败: {str(e)}")
+    if not os.path.exists(index_path):
         return {}
+    
+    existing_stocks = {}
+    
+    def read_with_encoding(encoding):
+        with open(index_path, 'r', newline='', encoding=encoding) as f:
+            # 首先尝试用DictReader，这是最理想的情况
+            try:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames or '股票代码' not in reader.fieldnames:
+                    raise ValueError("Incorrect headers") # 触发回退机制
+                
+                for row in reader:
+                    stock_code = str(row.get('股票代码')).zfill(6)
+                    if stock_code and stock_code != '000000':
+                        existing_stocks[stock_code] = row
+                return existing_stocks
+            except (ValueError, KeyError, IndexError):
+                # 如果DictReader失败，回退到普通Reader
+                f.seek(0)
+                plain_reader = csv.reader(f)
+                try:
+                    next(plain_reader) # 跳过表头
+                except StopIteration:
+                    return {} # 空文件
+
+                for row in plain_reader:
+                    if len(row) >= 5:
+                        stock_code = str(row[0]).zfill(6)
+                        if stock_code and stock_code != '000000':
+                            existing_stocks[stock_code] = {
+                                '股票代码': stock_code,
+                                '股票名称': row[1],
+                                '上市日期': row[2],
+                                '上市年限': row[3],
+                                '文件路径': row[4]
+                        }
+        return existing_stocks
+
+    try:
+        # 尝试用 utf-8-sig, 兼容 windows excel/notepad 保存的文件
+        return read_with_encoding('utf-8-sig')
+    except Exception:
+        try:
+            # 如果 utf-8-sig 失败, 尝试用 utf-8
+            return read_with_encoding('utf-8')
+        except Exception as e:
+            log_message("ERROR", f"加载索引文件失败: {e}")
+            # 如果两种编码都失败，返回空字典
+            return {}
 
 # 多线程配置（3线程最佳平衡方案）
 MULTITHREAD_CONFIG = {
@@ -1263,23 +1263,17 @@ class ThreadSafeAntiBlockManager(AntiBlockManager):
             self.last_request_time = time.time()
             self.request_count += 1
 
-def process_single_stock(stock_info, thread_id=0):
+def process_single_stock(stock_info, thread_id=0, result_queue=None):
     """处理单只股票（线程安全版本）"""
     stock_code = stock_info['股票代码']
     stock_name = stock_info['股票名称']
-    
-    # 创建线程专用的反制管理器
+    log_message("DEBUG", f"线程{thread_id} 开始处理 {stock_code}")
     thread_anti_block = ThreadSafeAntiBlockManager(thread_id)
-    
     try:
-        log_message("INFO", f"线程{thread_id} 处理股票 {stock_code} - {stock_name}")
-        
-        # 检查文件是否已存在
+        log_message("DEBUG", f"线程{thread_id} 获取上市日期和历史数据 {stock_code}")
         safe_name = stock_name.replace('*', '').replace('ST', '')
         found_file = None
         found_years = None
-        
-        # 遍历可能的年限文件夹
         for possible_years in range(36):
             possible_dir = os.path.join(DATA_DIR, f"{possible_years}年")
             possible_file = os.path.join(possible_dir, f"{stock_code}_{safe_name}.xlsx")
@@ -1287,8 +1281,6 @@ def process_single_stock(stock_info, thread_id=0):
                 found_file = possible_file
                 found_years = possible_years
                 break
-        
-        # 如果找到现有文件，跳过
         if found_file:
             log_message("INFO", f"线程{thread_id} 股票 {stock_code} 文件已存在，跳过")
             global_stats.update_success()
@@ -1300,64 +1292,44 @@ def process_single_stock(stock_info, thread_id=0):
                 'file_path': found_file,
                 'status': 'skipped'
             }
-            # 不需要更新索引，因为文件已存在
+            if result_queue is not None:
+                result_queue.put(result)
             return result
-        
-        # 获取上市日期和历史数据
         listing_date = get_stock_listing_date(stock_code)
         years = calculate_years_since_listing(listing_date)
-        
-        # 创建年限文件夹
         years_dir = os.path.join(DATA_DIR, f"{years}年")
         ensure_directory(years_dir)
-        
-        # 生成文件路径
         file_path = os.path.join(years_dir, f"{stock_code}_{safe_name}.xlsx")
-        
-        # 获取历史数据
         hist_data = get_stock_history_data(stock_code)
-        
+        log_message("DEBUG", f"线程{thread_id} 获取历史数据完成 {stock_code}, 数据行数: {0 if hist_data is None else len(hist_data)}")
         if hist_data is None or hist_data.empty:
             log_message("WARNING", f"线程{thread_id} 股票 {stock_code} 无历史数据")
             global_stats.update_failure()
             return None
-        
-        # 线程安全地创建Excel文件
-        with file_write_lock:
-            if create_excel_file(file_path, stock_name, hist_data):
-                log_message("INFO", f"线程{thread_id} 股票 {stock_code} 处理完成，数据量: {len(hist_data)}")
-                global_stats.update_success()
-                result = {
-                    'stock_code': stock_code,
-                    'stock_name': stock_name,
-                    'listing_date': listing_date,
-                    'years': years,
-                    'file_path': file_path,
-                    'status': 'success'
-                }
-                
-                # 立即更新索引文件，确保每个成功处理的股票都被记录
-                with index_update_lock:
-                    stock_info_for_index = {
-                        '股票代码': stock_code,
-                        '股票名称': stock_name,
-                        '上市日期': listing_date,
-                        '上市年限': years,
-                        '文件路径': file_path
-                    }
-                    save_index_file(stock_info_for_index)
-                
-                return result
-            else:
-                global_stats.update_failure()
-                return None
-                
+        log_message("DEBUG", f"线程{thread_id} 开始写Excel {file_path}")
+        if create_excel_file(file_path, stock_name, hist_data):
+            log_message("DEBUG", f"线程{thread_id} 写Excel完成 {file_path}")
+            log_message("INFO", f"线程{thread_id} 股票 {stock_code} 处理完成，数据量: {len(hist_data)}")
+            global_stats.update_success()
+            result = {
+                'stock_code': stock_code,
+                'stock_name': stock_name,
+                'listing_date': listing_date,
+                'years': years,
+                'file_path': file_path,
+                'status': 'success'
+            }
+            if result_queue is not None:
+                result_queue.put(result)
+            return result
+        else:
+            global_stats.update_failure()
+            return None
+        log_message("DEBUG", f"线程{thread_id} 结束处理 {stock_code}")
     except Exception as e:
         log_message("ERROR", f"线程{thread_id} 处理股票 {stock_code} 时发生错误: {str(e)}")
         global_stats.update_failure()
         return None
-
-# 删除了有问题的monitor_progress函数，改为在主线程中直接监控
 
 def initial_mode():
     """初始化模式 - 首次运行，下载所有可用历史数据（单线程版本）"""
@@ -1447,7 +1419,7 @@ def initial_mode():
                 success_count += 1
                 
                 # 立即更新索引文件，确保每个成功处理的股票都被记录
-                save_index_file(stock_info)
+                save_index_file([stock_info], INDEX_FILE)
             else:
                 anti_block_manager.update_failure(stock_code)
                 failed_count += 1
@@ -1459,7 +1431,7 @@ def initial_mode():
             continue
     
     # 保存最终索引文件（虽然每个股票都已经更新，但为了安全起见，再保存一次完整的）
-    save_index_file(processed_stocks)
+    save_index_file(processed_stocks, INDEX_FILE)
     
     # 获取详细统计信息
     progress_info = anti_block_manager.get_progress_info()
@@ -1473,7 +1445,7 @@ def update_mode():
     log_message("INFO", "将更新已有股票的最新数据")
     
     # 加载现有索引
-    processed_stocks = load_existing_index()
+    processed_stocks = load_existing_index(INDEX_FILE)
     if not processed_stocks:
         log_message("ERROR", "未找到索引文件，请先运行初始化模式")
         return False
@@ -1552,7 +1524,7 @@ def update_mode():
                 '上市年限': stock_info['上市年限'],
                 '文件路径': file_path
             }
-            save_index_file(updated_stock_info)
+            save_index_file([updated_stock_info], INDEX_FILE)
             
         except Exception as e:
             log_message("ERROR", f"更新股票 {stock_code} 时发生错误: {str(e)}")
@@ -1563,114 +1535,101 @@ def update_mode():
     return True
 
 def initial_mode_multithread():
-    """初始化模式 - 修复版3线程"""
+    """初始化模式 - 修复版3线程，分批提交任务，主线程批量写入索引文件"""
     log_message("INFO", "=== 初始化模式 (3线程修复版) ===")
     log_message("INFO", "将使用3线程并行下载A股所有可用历史数据")
-    
-    # 获取所有股票列表
     stock_list = get_all_stock_list()
     if stock_list is None:
         return False
-    
     total_stocks = len(stock_list)
-    processed_stocks = []
-    
     log_message("INFO", f"开始3线程处理 {total_stocks} 只股票")
-    
-    # 重置全局统计
     global_stats.total_processed = 0
     global_stats.total_success = 0
     global_stats.total_failed = 0
     global_stats.start_time = time.time()
     global_stats.active_threads = MULTITHREAD_CONFIG['max_workers']
-    
-    # 使用线程池处理
+    batch_size = 100
+    stock_iter = stock_list.iterrows()
+    completed_count = 0
+    failed_count = 0
+    all_results = Queue()
     with ThreadPoolExecutor(max_workers=MULTITHREAD_CONFIG['max_workers']) as executor:
-        # 提交任务
-        future_to_stock = {}
-        for index, stock in stock_list.iterrows():
-            thread_id = len(future_to_stock) % MULTITHREAD_CONFIG['max_workers']
-            future = executor.submit(process_single_stock, stock, thread_id)
-            future_to_stock[future] = stock
-        
-        log_message("INFO", f"已提交 {len(future_to_stock)} 个任务到线程池")
-        
-        # 使用as_completed收集结果，避免阻塞
-        completed_count = 0
-        failed_count = 0
-        
-        try:
-            # 使用as_completed替代按顺序收集，避免单个任务阻塞整个流程
-            for future in concurrent.futures.as_completed(future_to_stock, timeout=3600):  # 总超时1小时
+        while True:
+            future_to_stock = {}
+            for _ in range(batch_size):
                 try:
-                    stock = future_to_stock[future]
-                    result = future.result(timeout=60)  # 单个任务60秒超时
-                    
-                    completed_count += 1
-                    
-                    if result and result['status'] in ['success', 'skipped']:
-                        processed_stocks.append({
-                            '股票代码': result['stock_code'],
-                            '股票名称': result['stock_name'],
-                            '上市日期': result['listing_date'],
-                            '上市年限': result['years'],
-                            '文件路径': result['file_path']
-                        })
-                    else:
+                    index, stock = next(stock_iter)
+                except StopIteration:
+                    break
+                log_message("DEBUG", f"主线程准备提交任务: {stock['股票代码']}")
+                thread_id = len(future_to_stock) % MULTITHREAD_CONFIG['max_workers']
+                future = executor.submit(process_single_stock, stock, thread_id, all_results)
+                future_to_stock[future] = stock
+                log_message("DEBUG", f"主线程已提交任务: {stock['股票代码']}")
+            if not future_to_stock:
+                break
+            log_message("INFO", f"已提交本批 {len(future_to_stock)} 个任务到线程池")
+            try:
+                for future in concurrent.futures.as_completed(future_to_stock, timeout=3600):
+                    try:
+                        stock = future_to_stock[future]
+                        log_message("DEBUG", f"主线程准备获取future结果: {stock['股票代码']}")
+                        result = future.result(timeout=60)
+                        log_message("DEBUG", f"主线程future结果获取完成: {stock['股票代码']}")
+                        completed_count += 1
+                        if result and result['status'] not in ['success', 'skipped']:
+                            failed_count += 1
+                        if completed_count % 50 == 0:
+                            progress = (completed_count / total_stocks) * 100
+                            success_rate = (all_results.qsize() / completed_count) * 100 if completed_count > 0 else 0
+                            log_message("INFO", f"进度: {completed_count}/{total_stocks} ({progress:.1f}%), "
+                                       f"成功率: {success_rate:.1f}%, 失败: {failed_count}")
+                            if completed_count > 100 and success_rate < 70:
+                                log_message("WARNING", f"成功率过低 ({success_rate:.1f}%)，建议停止多线程模式")
+                                raise KeyboardInterrupt("成功率过低，中断多线程处理")
+                    except concurrent.futures.TimeoutError:
+                        stock = future_to_stock[future]
+                        log_message("ERROR", f"股票 {stock['股票代码']} 处理超时(60秒)")
                         failed_count += 1
-                    
-                    # 每50只股票显示一次进度报告
-                    if completed_count % 50 == 0:
-                        progress = (completed_count / total_stocks) * 100
-                        success_rate = (len(processed_stocks) / completed_count) * 100 if completed_count > 0 else 0
-                        log_message("INFO", f"进度: {completed_count}/{total_stocks} ({progress:.1f}%), "
-                                   f"成功率: {success_rate:.1f}%, 失败: {failed_count}")
-                        
-                        # 检查成功率，如果过低则中断
-                        if completed_count > 100 and success_rate < 70:
-                            log_message("WARNING", f"成功率过低 ({success_rate:.1f}%)，建议停止多线程模式")
-                            raise KeyboardInterrupt("成功率过低，中断多线程处理")
-                            
-                except concurrent.futures.TimeoutError:
-                    stock = future_to_stock[future]
-                    log_message("ERROR", f"股票 {stock['股票代码']} 处理超时(60秒)")
-                    failed_count += 1
-                    future.cancel()  # 尝试取消超时任务
-                    
-                except Exception as e:
-                    stock = future_to_stock[future]
-                    log_message("ERROR", f"股票 {stock['股票代码']} 处理失败: {str(e)}")
-                    failed_count += 1
-        
-        except concurrent.futures.TimeoutError:
-            log_message("ERROR", "线程池总体超时，强制结束")
-        except KeyboardInterrupt as e:
-            log_message("WARNING", f"用户中断或自动停止: {str(e)}")
-        except Exception as e:
-            log_message("ERROR", f"线程池处理出现异常: {str(e)}")
-    
+                        future.cancel()
+                    except Exception as e:
+                        stock = future_to_stock[future]
+                        log_message("ERROR", f"股票 {stock['股票代码']} 处理失败: {str(e)}")
+                        failed_count += 1
+            except concurrent.futures.TimeoutError:
+                log_message("ERROR", "线程池总体超时，强制结束")
+            except KeyboardInterrupt as e:
+                log_message("WARNING", f"用户中断或自动停止: {str(e)}")
+                break
+            except Exception as e:
+                log_message("ERROR", f"线程池处理出现异常: {str(e)}")
     global_stats.active_threads = 0
-    
-    # 保存最终索引文件（虽然每个股票都已经更新，但为了安全起见，再保存一次完整的）
-    save_index_file(processed_stocks)
-    
-    # 统计结果
+    # 主线程批量写入索引文件
+    results_list = []
+    while not all_results.empty():
+        result = all_results.get()
+        # 只收集成功和跳过的结果
+        if result and result.get('status') in ['success', 'skipped']:
+            results_list.append({
+                '股票代码': result['stock_code'],
+                '股票名称': result['stock_name'],
+                '上市日期': result['listing_date'],
+                '上市年限': result['years'],
+                '文件路径': result['file_path']
+            })
+    save_index_file(results_list, INDEX_FILE)
     stats = global_stats.get_stats()
     total_completed = completed_count
-    success_count = len(processed_stocks)
+    success_count = len(results_list)
     final_success_rate = (success_count / total_completed) * 100 if total_completed > 0 else 0
-    
     log_message("INFO", f"3线程初始化完成 - "
                f"总处理: {total_completed}/{total_stocks}, "
                f"成功: {success_count}, "
                f"失败: {failed_count}, "
                f"成功率: {final_success_rate:.1f}%, "
                f"总耗时: {stats['elapsed_time']/3600:.1f}小时")
-    
-    # 如果成功率低于80%，建议切换到单线程
     if final_success_rate < 80 and total_completed > 50:
         log_message("WARNING", "多线程成功率较低，建议重启程序使用单线程模式")
-    
     return total_completed > 0
 
 # ================== 分类修复功能 ==================
@@ -1889,43 +1848,46 @@ def main():
     
     # 首先选择运行模式
     print("请选择运行模式:")
-    print("1. 初始化模式 - 首次运行，下载所有可用历史数据")
-    print("2. 更新模式 - 日常使用，仅追加最新数据")
-    print("3. 分类修复模式 - 检查并修复错误分类的股票文件")
-    print("4. 测试年限计算 - 测试上市年限计算逻辑")
+    print("1. 初始化模式 - 首次运行，下载所有可用历史数据（单线程，推荐排查问题时使用）")
+    print("2. 初始化模式（多线程）- 并行下载，适合网络和接口稳定时")
+    print("3. 更新模式 - 日常使用，仅追加最新数据")
+    print("4. 分类修复模式 - 检查并修复错误分类的股票文件")
+    print("5. 测试年限计算 - 测试上市年限计算逻辑")
     
     while True:
-        choice = input("请输入选择 (1/2/3/4): ").strip()
-        if choice == '4':
+        choice = input("请输入选择 (1/2/3/4/5): ").strip()
+        if choice == '5':
             log_message("INFO", "用户选择：测试年限计算")
             test_years_calculation()
             break
-        elif choice == '3':
+        elif choice == '4':
             log_message("INFO", "用户选择：分类修复模式")
             if classification_fix_mode():
                 log_message("INFO", "分类修复模式完成")
             else:
                 log_message("ERROR", "分类修复模式失败")
             break
-        elif choice in ['1', '2']:
-            # 自动使用优化模式和多线程模式
-            switch_to_optimized_mode()
-            log_message("INFO", "自动选择优化模式（较快）")
-            
-            # 执行相应的下载模式
-            if choice == '1':
-                log_message("INFO", "用户选择：初始化模式")
-                log_message("INFO", "自动选择3线程模式")
-                if initial_mode_multithread():
-                    log_message("INFO", "3线程初始化模式完成")
-                else:
-                    log_message("ERROR", "3线程初始化模式失败")
-            elif choice == '2':
-                log_message("INFO", "用户选择：更新模式")
-                if update_mode():
-                    log_message("INFO", "更新模式完成")
-                else:
-                    log_message("ERROR", "更新模式失败")
+        elif choice == '3':
+            log_message("INFO", "用户选择：更新模式")
+            if update_mode():
+                log_message("INFO", "更新模式完成")
+            else:
+                log_message("ERROR", "更新模式失败")
+            break
+        elif choice == '2':
+            log_message("INFO", "用户选择：初始化模式（多线程）")
+            log_message("INFO", "自动选择3线程模式")
+            if initial_mode_multithread():
+                log_message("INFO", "3线程初始化模式完成")
+            else:
+                log_message("ERROR", "3线程初始化模式失败")
+            break
+        elif choice == '1':
+            log_message("INFO", "用户选择：初始化模式（单线程）")
+            if initial_mode():
+                log_message("INFO", "单线程初始化模式完成")
+            else:
+                log_message("ERROR", "单线程初始化模式失败")
             break
         else:
             print("无效选择，请重新输入")
@@ -2046,7 +2008,7 @@ def sync_index_with_files():
     log_message("INFO", f"在文件夹中找到 {total_files} 个股票文件")
     
     # 加载现有索引
-    existing_index = load_existing_index()
+    existing_index = load_existing_index(INDEX_FILE)
     existing_count = len(existing_index) if existing_index else 0
     log_message("INFO", f"现有索引中有 {existing_count} 条记录")
     
@@ -2063,7 +2025,7 @@ def sync_index_with_files():
                 file_info['上市日期'] = ''
     
     # 保存更新后的索引
-    save_index_file(list(found_files.values()))
+    save_index_file(list(found_files.values()), INDEX_FILE)
     log_message("INFO", f"索引已更新，现包含 {len(found_files)} 条记录")
     
     return True
