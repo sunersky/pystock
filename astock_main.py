@@ -605,10 +605,10 @@ def calculate_years_since_listing(listing_date):
         else:
             # 已经是date对象
             listing_date_obj = listing_date
-        
-        # 简化计算年限：只考虑自然年
-        current_date = date.today()
-        years = current_date.year - listing_date_obj.year
+
+            # 简化计算年限：只考虑自然年
+            current_date = date.today()
+            years = current_date.year - listing_date_obj.year
         
         # 不再考虑月份和日期，直接返回年份差
         return max(0, years)
@@ -980,34 +980,24 @@ def calculate_trade_count_smart(hist_data):
         log_message("WARNING", f"智能计算成交次数失败: {str(e)}")
         return [0] * len(hist_data)
 
-# 全局股票名称缓存
-STOCK_NAME_CACHE = {}
+def load_name_cache_from_index(index_file):
+    name_cache = {}
+    if os.path.exists(index_file):
+        with open(index_file, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                code = str(row.get('股票代码')).zfill(6)
+                name = row.get('股票名称', '')
+                if code and name:
+                    name_cache[code] = name
+    return name_cache
+
+# 全局股票名称缓存，程序启动时即加载
+STOCK_NAME_CACHE = load_name_cache_from_index(INDEX_FILE)
 
 def get_stock_name(stock_code):
-    """获取股票名称（使用缓存优化）"""
-    global STOCK_NAME_CACHE
-    
-    # 先从缓存中查找
-    if stock_code in STOCK_NAME_CACHE:
-        return STOCK_NAME_CACHE[stock_code]
-    
-    try:
-        # 如果缓存为空，获取一次完整的股票列表
-        if not STOCK_NAME_CACHE:
-            log_message("INFO", "首次获取股票名称列表，建立缓存...")
-            stock_info = ak.stock_info_a_code_name()
-            if stock_info is not None:
-                # 建立代码到名称的映射缓存
-                for _, row in stock_info.iterrows():
-                    STOCK_NAME_CACHE[row['code']] = row['name']
-                log_message("INFO", f"股票名称缓存建立完成，包含 {len(STOCK_NAME_CACHE)} 只股票")
-        
-        # 从缓存中返回
-        return STOCK_NAME_CACHE.get(stock_code, stock_code)
-        
-    except Exception as e:
-        log_message("WARNING", f"获取股票 {stock_code} 名称失败: {str(e)}")
-        return stock_code
+    # 只查本地缓存，不联网
+    return STOCK_NAME_CACHE.get(stock_code, stock_code)
 
 def create_excel_file(file_path, stock_name, data):
     """创建Excel文件（基于模板文件，始终写入Sheet1）"""
@@ -1159,7 +1149,7 @@ def load_existing_index(index_path):
             log_message("ERROR", f"加载索引文件失败: {e}")
             # 如果两种编码都失败，返回空字典
             return {}
-
+            
 # 多线程配置（3线程最佳平衡方案）
 MULTITHREAD_CONFIG = {
     'max_workers': 3,  # 3线程平衡方案
@@ -1440,197 +1430,40 @@ def initial_mode():
     return True
 
 def update_mode():
-    """更新模式 - 日常使用，仅追加最新数据"""
-    log_message("INFO", "=== 更新模式 ===")
-    log_message("INFO", "将更新已有股票的最新数据")
-    
-    # 加载现有索引
+    """更新模式 - 多线程并发更新所有股票，批量写入索引文件"""
+    log_message("INFO", "=== 更新模式（多线程） ===")
+    log_message("INFO", "将并发更新所有已归档股票，仅追加最新数据")
     processed_stocks = load_existing_index(INDEX_FILE)
     if not processed_stocks:
         log_message("ERROR", "未找到索引文件，请先运行初始化模式")
         return False
-    
-    success_count = 0
-    failed_count = 0
-    
-    for stock_code, stock_info in processed_stocks.items():
-        log_message("INFO", f"更新股票 {stock_code} - {stock_info['股票名称']}")
-        
-        try:
-            file_path = stock_info['文件路径']
-            
-            # 检查文件是否存在
-            if not os.path.exists(file_path):
-                log_message("WARNING", f"文件不存在，跳过: {file_path}")
-                failed_count += 1
-                continue
-            
-            # 读取现有文件，获取最后日期
-            wb = load_workbook(file_path)
-            ws = wb.active
-            
-            last_date = None
-            for row in range(ws.max_row, 1, -1):
-                date_value = ws.cell(row=row, column=1).value
-                if date_value:
-                    if isinstance(date_value, str):
-                        last_date = date_value
-                    else:
-                        last_date = date_value.strftime("%Y-%m-%d")
-                    break
-            
-            wb.close()
-            
-            if last_date is None:
-                log_message("WARNING", f"无法获取股票 {stock_code} 的最后日期")
-                failed_count += 1
-                continue
-            
-            # 获取最新数据（包含智能计算的成交次数）
-            start_date = (datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            
-            new_data = get_stock_history_data(stock_code, start_date)
-            
-            if new_data is None or new_data.empty:
-                log_message("INFO", f"股票 {stock_code} 数据已是最新")
-                success_count += 1
-                continue
-            
-            # 追加新数据到Excel文件
-            wb = load_workbook(file_path)
-            ws = wb.active
-            
-            for _, row_data in new_data.iterrows():
-                new_row = ws.max_row + 1
-                for col_idx, header in enumerate(EXCEL_HEADERS, 1):
-                    if header == '名称':
-                        ws.cell(row=new_row, column=col_idx, value=stock_info['股票名称'])
-                    else:
-                        value = row_data[header]
-                        ws.cell(row=new_row, column=col_idx, value=value)
-            
-            wb.save(file_path)
-            wb.close()
-            
-            log_message("INFO", f"股票 {stock_code} 更新完成，新增 {len(new_data)} 条数据")
-            success_count += 1
-            
-            # 立即更新索引文件，确保每个成功更新的股票都被记录
-            # 在更新模式下，我们只需要确保文件路径正确，其他信息不变
-            updated_stock_info = {
-                '股票代码': stock_code,
-                '股票名称': stock_info['股票名称'],
-                '上市日期': stock_info['上市日期'],
-                '上市年限': stock_info['上市年限'],
-                '文件路径': file_path
-            }
-            save_index_file([updated_stock_info], INDEX_FILE)
-            
-        except Exception as e:
-            log_message("ERROR", f"更新股票 {stock_code} 时发生错误: {str(e)}")
-            failed_count += 1
-            continue
-    
-    log_message("INFO", f"更新完成 - 成功: {success_count}, 失败: {failed_count}")
+    stock_items = list(processed_stocks.items())
+    total = len(stock_items)
+    log_message("INFO", f"共需更新 {total} 只股票")
+    result_queue = Queue()
+    max_workers = MULTITHREAD_CONFIG.get('max_workers', 3)
+    batch_size = MULTITHREAD_CONFIG.get('batch_size_total', 120)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for i in range(0, total, batch_size):
+            batch = stock_items[i:i+batch_size]
+            futures = []
+            for idx, (stock_code, stock_info) in enumerate(batch):
+                thread_id = idx % max_workers
+                futures.append(executor.submit(update_single_stock, stock_code, stock_info, result_queue, thread_id))
+            for f in concurrent.futures.as_completed(futures):
+                completed += 1
+                if completed % 20 == 0 or completed == total:
+                    log_message("INFO", f"进度: {completed}/{total} ({completed/total*100:.1f}%)")
+    # 收集所有结果，批量写索引
+    updated_list = []
+    while not result_queue.empty():
+        updated_list.append(result_queue.get())
+    if updated_list:
+        save_index_file(updated_list, INDEX_FILE)
+        log_message("INFO", f"索引文件已批量更新，共 {len(updated_list)} 条")
+    log_message("INFO", "多线程更新完成")
     return True
-
-def initial_mode_multithread():
-    """初始化模式 - 修复版3线程，分批提交任务，主线程批量写入索引文件"""
-    log_message("INFO", "=== 初始化模式 (3线程修复版) ===")
-    log_message("INFO", "将使用3线程并行下载A股所有可用历史数据")
-    stock_list = get_all_stock_list()
-    if stock_list is None:
-        return False
-    total_stocks = len(stock_list)
-    log_message("INFO", f"开始3线程处理 {total_stocks} 只股票")
-    global_stats.total_processed = 0
-    global_stats.total_success = 0
-    global_stats.total_failed = 0
-    global_stats.start_time = time.time()
-    global_stats.active_threads = MULTITHREAD_CONFIG['max_workers']
-    batch_size = 100
-    stock_iter = stock_list.iterrows()
-    completed_count = 0
-    failed_count = 0
-    all_results = Queue()
-    with ThreadPoolExecutor(max_workers=MULTITHREAD_CONFIG['max_workers']) as executor:
-        while True:
-            future_to_stock = {}
-            for _ in range(batch_size):
-                try:
-                    index, stock = next(stock_iter)
-                except StopIteration:
-                    break
-                log_message("DEBUG", f"主线程准备提交任务: {stock['股票代码']}")
-                thread_id = len(future_to_stock) % MULTITHREAD_CONFIG['max_workers']
-                future = executor.submit(process_single_stock, stock, thread_id, all_results)
-                future_to_stock[future] = stock
-                log_message("DEBUG", f"主线程已提交任务: {stock['股票代码']}")
-            if not future_to_stock:
-                break
-            log_message("INFO", f"已提交本批 {len(future_to_stock)} 个任务到线程池")
-            try:
-                for future in concurrent.futures.as_completed(future_to_stock, timeout=3600):
-                    try:
-                        stock = future_to_stock[future]
-                        log_message("DEBUG", f"主线程准备获取future结果: {stock['股票代码']}")
-                        result = future.result(timeout=60)
-                        log_message("DEBUG", f"主线程future结果获取完成: {stock['股票代码']}")
-                        completed_count += 1
-                        if result and result['status'] not in ['success', 'skipped']:
-                            failed_count += 1
-                        if completed_count % 50 == 0:
-                            progress = (completed_count / total_stocks) * 100
-                            success_rate = (all_results.qsize() / completed_count) * 100 if completed_count > 0 else 0
-                            log_message("INFO", f"进度: {completed_count}/{total_stocks} ({progress:.1f}%), "
-                                       f"成功率: {success_rate:.1f}%, 失败: {failed_count}")
-                            if completed_count > 100 and success_rate < 70:
-                                log_message("WARNING", f"成功率过低 ({success_rate:.1f}%)，建议停止多线程模式")
-                                raise KeyboardInterrupt("成功率过低，中断多线程处理")
-                    except concurrent.futures.TimeoutError:
-                        stock = future_to_stock[future]
-                        log_message("ERROR", f"股票 {stock['股票代码']} 处理超时(60秒)")
-                        failed_count += 1
-                        future.cancel()
-                    except Exception as e:
-                        stock = future_to_stock[future]
-                        log_message("ERROR", f"股票 {stock['股票代码']} 处理失败: {str(e)}")
-                        failed_count += 1
-            except concurrent.futures.TimeoutError:
-                log_message("ERROR", "线程池总体超时，强制结束")
-            except KeyboardInterrupt as e:
-                log_message("WARNING", f"用户中断或自动停止: {str(e)}")
-                break
-            except Exception as e:
-                log_message("ERROR", f"线程池处理出现异常: {str(e)}")
-    global_stats.active_threads = 0
-    # 主线程批量写入索引文件
-    results_list = []
-    while not all_results.empty():
-        result = all_results.get()
-        # 只收集成功和跳过的结果
-        if result and result.get('status') in ['success', 'skipped']:
-            results_list.append({
-                '股票代码': result['stock_code'],
-                '股票名称': result['stock_name'],
-                '上市日期': result['listing_date'],
-                '上市年限': result['years'],
-                '文件路径': result['file_path']
-            })
-    save_index_file(results_list, INDEX_FILE)
-    stats = global_stats.get_stats()
-    total_completed = completed_count
-    success_count = len(results_list)
-    final_success_rate = (success_count / total_completed) * 100 if total_completed > 0 else 0
-    log_message("INFO", f"3线程初始化完成 - "
-               f"总处理: {total_completed}/{total_stocks}, "
-               f"成功: {success_count}, "
-               f"失败: {failed_count}, "
-               f"成功率: {final_success_rate:.1f}%, "
-               f"总耗时: {stats['elapsed_time']/3600:.1f}小时")
-    if final_success_rate < 80 and total_completed > 50:
-        log_message("WARNING", "多线程成功率较低，建议重启程序使用单线程模式")
-    return total_completed > 0
 
 # ================== 分类修复功能 ==================
 
@@ -1837,6 +1670,9 @@ def main():
     print(f"📁 数据保存位置: {ROOT_DIR}")
     print()
     
+    # 输出本地股票名称缓存加载条数
+    log_message("INFO", f"已加载本地股票名称缓存，共 {len(STOCK_NAME_CACHE)} 条")
+    
     start_time = datetime.now()
     
     # 创建必要的目录
@@ -1853,10 +1689,18 @@ def main():
     print("3. 更新模式 - 日常使用，仅追加最新数据")
     print("4. 分类修复模式 - 检查并修复错误分类的股票文件")
     print("5. 测试年限计算 - 测试上市年限计算逻辑")
+    print("6. 多线程更新模式 - 并发更新所有已归档股票（推荐日常使用）")
     
     while True:
-        choice = input("请输入选择 (1/2/3/4/5): ").strip()
-        if choice == '5':
+        choice = input("请输入选择 (1/2/3/4/5/6): ").strip()
+        if choice == '6':
+            log_message("INFO", "用户选择：多线程更新模式")
+            if update_mode_multithread():
+                log_message("INFO", "多线程更新模式完成")
+            else:
+                log_message("ERROR", "多线程更新模式失败")
+            break
+        elif choice == '5':
             log_message("INFO", "用户选择：测试年限计算")
             test_years_calculation()
             break
@@ -2085,6 +1929,9 @@ if __name__ == "__main__":
         elif sys.argv[1] == "--init":
             switch_to_optimized_mode()
             initial_mode_multithread()
+        elif sys.argv[1] == "--update-mt":
+            switch_to_optimized_mode()
+            update_mode_multithread()
         else:
             main()
     else:
